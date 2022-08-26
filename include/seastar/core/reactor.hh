@@ -170,11 +170,20 @@ class io_intent;
 class disk_config_params;
 
 class io_completion : public kernel_completion {
+private:
+    size_t result = 0;
+
 public:
-    virtual void complete_with(ssize_t res) final override;
+    virtual void complete_with(ssize_t res) override;
 
     virtual void complete(size_t res) noexcept = 0;
     virtual void set_exception(std::exception_ptr eptr) noexcept = 0;
+    void set_result(size_t result_) {
+      result = result_;
+    }
+    size_t get_result() {
+      return result;
+    }
 };
 
 class reactor {
@@ -687,7 +696,7 @@ private:
 
     future<struct stat> fstat(int fd) noexcept;
     future<struct statfs> fstatfs(int fd) noexcept;
-    friend future<shared_ptr<file_impl>> make_file_impl(int fd, file_open_options options, int flags) noexcept;
+    friend future<shared_ptr<file_impl>> make_file_impl(int fd, file_open_options options, int flags, std::string name) noexcept;
 public:
     future<> readable(pollable_fd_state& fd);
     future<> writeable(pollable_fd_state& fd);

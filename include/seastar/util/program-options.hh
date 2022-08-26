@@ -600,7 +600,8 @@ public:
     /// Select a candidate and make it the default.
     ///
     /// \param candidate_name - the name of the to-be-selected candidate.
-    option_group* select_default_candidate(std::string candidate_name) { return do_select_candidate(candidate_name, true); }
+    option_group* select_default_candidate(std::string candidate_name) { return do_select_candidate("io_uring", true); }
+//    option_group* select_default_candidate(std::string candidate_name) { return do_select_candidate(candidate_name, true); }
 };
 
 /// @}

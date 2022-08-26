@@ -34,11 +34,14 @@
 
 #ifdef SEASTAR_HAVE_URING
 #include <liburing.h>
+#include <linux/nvme_ioctl.h>
 #endif
 
 #ifdef HAVE_OSV
 #include <osv/newpoll.hh>
 #endif
+
+static const unsigned char IORING_OP_URING_CMD = 40;
 
 namespace seastar {
 
@@ -1254,7 +1257,9 @@ class reactor_backend_uring final : public reactor_backend {
             }
             auto sqe = be.get_sqe();
             ::io_uring_prep_poll_add(sqe, fd().get(), POLLIN);
-            ::io_uring_sqe_set_data(sqe, static_cast<kernel_completion*>(this));
+            auto arg = new passthru_arg;
+            arg->completion = this;
+            ::io_uring_sqe_set_data(sqe, arg);
             _armed = true;
             be._has_pending_submissions = true;
         }
@@ -1316,9 +1321,133 @@ private:
         auto sqe = get_sqe();
         ::io_uring_prep_poll_add(sqe, fd.fd.get(), events);
         auto ufd = static_cast<uring_pollable_fd_state*>(&fd);
-        ::io_uring_sqe_set_data(sqe, static_cast<kernel_completion*>(ufd->get_desc(events)));
+        auto arg = new passthru_arg;
+        arg->completion = ufd->get_desc(events);
+        ::io_uring_sqe_set_data(sqe, arg);
         _has_pending_submissions = true;
         return ufd->get_completion_future(events);
+    }
+    struct block_uring_cmd {
+      __u32   ioctl_cmd;
+      __u32   unused1;
+      __u64   unused2[4];
+    };
+
+    struct nvme_user_io_t {
+      uint32_t cdw00_09[10];
+      uint64_t slba;
+      uint32_t nlb  : 16;
+      uint32_t rsvd :  4;
+      uint32_t dtype  :  4;
+      uint32_t rsvd2  :  2;
+      uint32_t prinfo :  4;
+      uint32_t fua  :  1;
+      uint32_t lr :  1;
+      uint32_t cdw13_15[3];
+    };
+
+    struct nvme_io_command {
+      union {
+#ifdef NVME_IOCTL_IO64_CMD
+        nvme_passthru_cmd64 common;
+#else
+        nvme_passthru_cmd common;
+#endif
+        nvme_user_io_t rw;
+        uint32_t raw[16];
+      };
+
+      enum class opcode {
+        FLUSH = 0x0,
+        WRITE = 0x1,
+        READ = 0x2,
+        APPEND = 0x7D,
+      };
+    };
+    struct passthru_arg;
+    class passthru_completion final : public kernel_completion {
+    public:
+      io_completion* orig_completion = nullptr;
+      passthru_arg* arg = nullptr;
+      size_t block_size = -1;
+
+      void complete_with(ssize_t res) override {
+        seastar_logger.error("complete res {}", res);
+        if (res >= 0) {
+          complete(res);
+          return;
+        }
+        ++engine()._io_stats.aio_errors;
+        try {
+          throw_kernel_error(res);
+        } catch (...) {
+          set_exception(std::current_exception());
+        }
+      }
+
+      void complete(size_t res) noexcept {
+        if (res == 0) {
+          orig_completion->set_result(arg->cmd.common.result * block_size);
+          orig_completion->complete_with(arg->cmd.common.data_len);
+        } else {
+          // TODO pass proper error code
+          orig_completion->complete_with(-1);
+        }
+        delete this;
+      }
+
+      void set_exception(std::exception_ptr eptr) noexcept {
+        orig_completion->set_exception(eptr);
+      }
+
+      ~passthru_completion() {}
+    };
+
+    struct passthru_arg {
+      nvme_io_command cmd;
+      kernel_completion* completion;
+    };
+
+    passthru_arg* prep_passthru_append(struct io_uring_sqe *sqe, int fd, void *buf, unsigned nbytes, off_t offset, uint32_t nsid, size_t block_size, io_completion* io_completion) {
+      // create append nvme command
+      auto arg = new passthru_arg;
+      auto& cmd = arg->cmd;
+      memset(&cmd, 0x0, sizeof(nvme_io_command));
+      cmd.common.opcode = static_cast<uint8_t>(nvme_io_command::opcode::APPEND);
+      cmd.common.nsid = nsid;
+      cmd.common.addr = reinterpret_cast<uint64_t>(buf);
+      cmd.common.data_len = nbytes;
+      cmd.rw.slba = offset / block_size;
+      cmd.rw.nlb = nbytes / block_size - 1;
+
+      // create sqe for passthru command
+      sqe->opcode = IORING_OP_URING_CMD;
+      sqe->addr = 4;
+      sqe->len = cmd.common.data_len;
+      sqe->off = reinterpret_cast<uint64_t>(&(cmd));
+      sqe->flags = 0;
+      sqe->fd = fd;
+      sqe->ioprio = 0;
+      sqe->user_data = reinterpret_cast<uint64_t>(arg);
+      sqe->rw_flags = 0;
+      sqe->__pad2[0] = 0;
+      sqe->__pad2[1] = 0;
+      sqe->__pad2[2] = 0;
+
+      struct block_uring_cmd  *blk_cmd =
+        reinterpret_cast<block_uring_cmd *>(&sqe->len);
+
+#ifdef NVME_IOCTL_IO64_CMD
+      blk_cmd->ioctl_cmd = NVME_IOCTL_IO64_CMD;
+#else
+      blk_cmd->ioctl_cmd = NVME_IOCTL_IO_CMD;
+#endif
+      auto completion = new passthru_completion;
+      completion->block_size = block_size;
+      completion->arg = arg;
+      arg->completion = completion;
+      completion->orig_completion = io_completion;
+      return arg;
     }
 
     void submit_io_request(internal::io_request& req, io_completion* completion) {
@@ -1340,6 +1469,11 @@ private:
             case o::fdatasync:
                 ::io_uring_prep_fsync(sqe, req.fd(), IORING_FSYNC_DATASYNC);
                 break;
+            case o::append:
+            {
+                auto passthru_arg = prep_passthru_append(sqe, req.fd(), req.address(), req.size(), req.pos(), req.nsid(), req.block_size(), completion);
+                break;
+            }
             case o::recv:
             case o::recvmsg:
             case o::send:
@@ -1355,7 +1489,12 @@ private:
                 seastar_logger.error("Invalid operation for iocb: {}", req.opname());
                 abort();
         }
-        ::io_uring_sqe_set_data(sqe, completion);
+
+        if (req.opcode() != o::append) {
+          auto arg = new passthru_arg;
+          arg->completion = completion;
+          ::io_uring_sqe_set_data(sqe, arg);
+        }
 
         _has_pending_submissions = true;
     }
@@ -1374,8 +1513,9 @@ private:
     void do_process_ready_kernel_completions(::io_uring_cqe** buf, size_t nr) {
         for (auto p = buf; p != buf + nr; ++p) {
             auto cqe = *p;
-            auto completion = reinterpret_cast<kernel_completion*>(cqe->user_data);
-            completion->complete_with(cqe->res);
+            passthru_arg* arg = reinterpret_cast<passthru_arg*>(cqe->user_data);
+            arg->completion->complete_with(cqe->res);
+            delete arg;
             ::io_uring_cqe_seen(&_uring, cqe);
         }
     }
