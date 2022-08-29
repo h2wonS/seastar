@@ -57,6 +57,7 @@ debian_packages=(
     doxygen
     openssl
     pkg-config
+    libnvme
 )
 
 # seastar doesn't directly depend on these packages. They are
